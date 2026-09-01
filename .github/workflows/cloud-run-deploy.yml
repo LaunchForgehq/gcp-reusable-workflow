@@ -1,0 +1,327 @@
+name: Deploy to Cloud Run
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub deployment environment (dev, stage, or production).
+        required: true
+        type: string
+      project_id:
+        description: Google Cloud project ID.
+        required: true
+        type: string
+      region:
+        description: Google Cloud region for Artifact Registry and Cloud Run.
+        required: false
+        default: us-central1
+        type: string
+      service:
+        description: Cloud Run service name and container image name.
+        required: true
+        type: string
+      artifact_registry:
+        description: Artifact Registry repository name.
+        required: true
+        type: string
+      docker_context:
+        description: Docker build context, relative to the repository root.
+        required: false
+        default: .
+        type: string
+      dockerfile:
+        description: Dockerfile path, relative to the repository root.
+        required: false
+        default: ./Dockerfile
+        type: string
+      workload_identity_provider:
+        description: Full Workload Identity Provider resource name.
+        required: true
+        type: string
+      deploy_service_account:
+        description: Service account impersonated by GitHub Actions for deployment.
+        required: true
+        type: string
+      runtime_service_account:
+        description: Optional service account used by the running Cloud Run revision.
+        required: false
+        default: ""
+        type: string
+      env_vars:
+        description: Non-sensitive Cloud Run environment variables as newline-separated KEY=VALUE entries.
+        required: false
+        default: ""
+        type: string
+      secret_refs:
+        description: Secret Manager references as newline-separated KEY=SECRET:VERSION entries.
+        required: false
+        default: ""
+        type: string
+      cloud_run_flags:
+        description: Additional flags accepted by gcloud run deploy.
+        required: false
+        default: ""
+        type: string
+      setup_command:
+        description: Optional application setup or dependency installation command.
+        required: false
+        default: ""
+        type: string
+      lint_command:
+        description: Optional lint or static-validation command.
+        required: false
+        default: ""
+        type: string
+      test_command:
+        description: Optional application test command.
+        required: false
+        default: ""
+        type: string
+      pre_build_command:
+        description: Optional final validation or application build command run before Docker build.
+        required: false
+        default: ""
+        type: string
+    outputs:
+      service_url:
+        description: URL of the deployed Cloud Run service.
+        value: ${{ jobs.deploy.outputs.service_url }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Validate, build, and deploy
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: cloud-run-${{ inputs.environment }}-${{ inputs.project_id }}-${{ inputs.region }}-${{ inputs.service }}
+      cancel-in-progress: false
+    outputs:
+      service_url: ${{ steps.deploy.outputs.url }}
+    env:
+      IMAGE: ${{ inputs.region }}-docker.pkg.dev/${{ inputs.project_id }}/${{ inputs.artifact_registry }}/${{ inputs.service }}:${{ github.sha }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Validate deployment configuration
+        shell: bash
+        env:
+          DEPLOYMENT_ENVIRONMENT: ${{ inputs.environment }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          REGION: ${{ inputs.region }}
+          SERVICE: ${{ inputs.service }}
+          ARTIFACT_REGISTRY: ${{ inputs.artifact_registry }}
+          DOCKER_CONTEXT: ${{ inputs.docker_context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          WORKLOAD_IDENTITY_PROVIDER: ${{ inputs.workload_identity_provider }}
+          DEPLOY_SERVICE_ACCOUNT: ${{ inputs.deploy_service_account }}
+          RUNTIME_SERVICE_ACCOUNT: ${{ inputs.runtime_service_account }}
+          CLOUD_RUN_FLAGS: ${{ inputs.cloud_run_flags }}
+        run: |
+          set -euo pipefail
+
+          required_names=(
+            PROJECT_ID
+            REGION
+            SERVICE
+            ARTIFACT_REGISTRY
+            DOCKER_CONTEXT
+            DOCKERFILE
+            WORKLOAD_IDENTITY_PROVIDER
+            DEPLOY_SERVICE_ACCOUNT
+          )
+
+          for name in "${required_names[@]}"; do
+            if [[ -z "${!name//[[:space:]]/}" ]]; then
+              echo "::error title=Invalid deployment configuration::${name} must not be empty."
+              exit 1
+            fi
+          done
+
+          if [[ ! "$DEPLOYMENT_ENVIRONMENT" =~ ^(dev|stage|production)$ ]]; then
+            echo "::error title=Invalid environment::environment must be one of: dev, stage, production."
+            exit 1
+          fi
+
+          if [[ ! "$REGION" =~ ^[a-z][a-z0-9-]*[a-z0-9]$ ]]; then
+            echo "::error title=Invalid region::region must be a valid Google Cloud region name."
+            exit 1
+          fi
+
+          if [[ ! "$PROJECT_ID" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+            echo "::error title=Invalid project ID::project_id must be a standard 6-30 character Google Cloud project ID. Legacy domain-scoped project IDs are not supported."
+            exit 1
+          fi
+
+          if [[ ! "$SERVICE" =~ ^[a-z]([a-z0-9-]{0,47}[a-z0-9])?$ ]]; then
+            echo "::error title=Invalid service::service must be a valid Cloud Run service name (lowercase letters, numbers, and hyphens; at most 49 characters)."
+            exit 1
+          fi
+
+          if [[ ! "$ARTIFACT_REGISTRY" =~ ^[a-z0-9]([a-z0-9._-]{0,61}[a-z0-9])?$ ]]; then
+            echo "::error title=Invalid Artifact Registry repository::artifact_registry must be a 1-63 character lowercase repository name, not a path."
+            exit 1
+          fi
+
+          if [[ ! "$WORKLOAD_IDENTITY_PROVIDER" =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[^/]+/providers/[^/]+$ ]]; then
+            echo "::error title=Invalid Workload Identity Provider::workload_identity_provider must be the full provider resource name and use the numeric project number."
+            exit 1
+          fi
+
+          service_account_pattern='^[a-z0-9][a-z0-9._-]*@[a-z0-9][a-z0-9.-]*\.iam\.gserviceaccount\.com$'
+          if [[ ! "$DEPLOY_SERVICE_ACCOUNT" =~ $service_account_pattern ]]; then
+            echo "::error title=Invalid deployment service account::deploy_service_account must be a Google service-account email."
+            exit 1
+          fi
+
+          if [[ -n "$RUNTIME_SERVICE_ACCOUNT" && ! "$RUNTIME_SERVICE_ACCOUNT" =~ $service_account_pattern ]]; then
+            echo "::error title=Invalid runtime service account::runtime_service_account must be empty or a Google service-account email."
+            exit 1
+          fi
+
+          if [[ "$CLOUD_RUN_FLAGS" =~ --(set|update|remove|clear)-(env-vars|secrets)(=|[[:space:]]|$) ]]; then
+            echo "::error title=Conflicting Cloud Run flags::Use env_vars or secret_refs instead of environment/secret mutation flags; the dedicated inputs preserve merge semantics."
+            exit 1
+          fi
+
+          if [[ "$CLOUD_RUN_FLAGS" =~ --service-account(=|[[:space:]]|$) ]]; then
+            echo "::error title=Conflicting runtime identity::Use runtime_service_account instead of --service-account in cloud_run_flags."
+            exit 1
+          fi
+
+          if [[ ! -d "$DOCKER_CONTEXT" ]]; then
+            echo "::error title=Invalid Docker context::docker_context does not exist or is not a directory: $DOCKER_CONTEXT"
+            exit 1
+          fi
+
+          if [[ ! -f "$DOCKERFILE" ]]; then
+            echo "::error title=Invalid Dockerfile::dockerfile does not exist or is not a file: $DOCKERFILE"
+            exit 1
+          fi
+
+      - name: Application setup
+        if: ${{ inputs.setup_command != '' }}
+        shell: bash
+        env:
+          APP_COMMAND: ${{ inputs.setup_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
+
+      - name: Lint and static validation
+        if: ${{ inputs.lint_command != '' }}
+        shell: bash
+        env:
+          APP_COMMAND: ${{ inputs.lint_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
+
+      - name: Run application tests
+        if: ${{ inputs.test_command != '' }}
+        shell: bash
+        env:
+          APP_COMMAND: ${{ inputs.test_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
+
+      - name: Pre-build validation
+        if: ${{ inputs.pre_build_command != '' }}
+        shell: bash
+        env:
+          APP_COMMAND: ${{ inputs.pre_build_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ inputs.project_id }}
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.deploy_service_account }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ inputs.project_id }}
+
+      - name: Configure Docker for Artifact Registry
+        shell: bash
+        env:
+          REGISTRY_HOST: ${{ inputs.region }}-docker.pkg.dev
+        run: gcloud auth configure-docker "$REGISTRY_HOST" --quiet
+
+      - name: Build immutable container image
+        shell: bash
+        env:
+          DOCKER_CONTEXT: ${{ inputs.docker_context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: docker build --file "$DOCKERFILE" --tag "$IMAGE" "$DOCKER_CONTEXT"
+
+      - name: Push immutable container image
+        shell: bash
+        run: docker push "$IMAGE"
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v3
+        with:
+          project_id: ${{ inputs.project_id }}
+          region: ${{ inputs.region }}
+          service: ${{ inputs.service }}
+          image: ${{ env.IMAGE }}
+          env_vars: ${{ inputs.env_vars }}
+          env_vars_update_strategy: merge
+          secrets: ${{ inputs.secret_refs }}
+          secrets_update_strategy: merge
+          flags: |-
+            ${{ inputs.cloud_run_flags }}
+            ${{ inputs.runtime_service_account != '' && format('--service-account={0}', inputs.runtime_service_account) || '' }}
+
+      - name: Write deployment summary
+        shell: bash
+        env:
+          DEPLOYMENT_ENVIRONMENT: ${{ inputs.environment }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          REGION: ${{ inputs.region }}
+          SERVICE: ${{ inputs.service }}
+          SERVICE_URL: ${{ steps.deploy.outputs.url }}
+          GIT_SHA: ${{ github.sha }}
+          SETUP_CONFIGURED: ${{ inputs.setup_command != '' }}
+          LINT_CONFIGURED: ${{ inputs.lint_command != '' }}
+          TESTS_CONFIGURED: ${{ inputs.test_command != '' }}
+          PRE_BUILD_CONFIGURED: ${{ inputs.pre_build_command != '' }}
+        run: |
+          set -euo pipefail
+
+          status() {
+            if [[ "$1" == "true" ]]; then
+              printf 'PASS'
+            else
+              printf 'SKIPPED (not configured)'
+            fi
+          }
+
+          {
+            echo "## Cloud Run Deployment"
+            echo
+            echo "### Application validation"
+            echo
+            echo "| Gate | Status |"
+            echo "| --- | --- |"
+            echo "| Setup | $(status "$SETUP_CONFIGURED") |"
+            echo "| Lint | $(status "$LINT_CONFIGURED") |"
+            echo "| Tests | $(status "$TESTS_CONFIGURED") |"
+            echo "| Pre-build | $(status "$PRE_BUILD_CONFIGURED") |"
+            echo
+            echo "### Deployment"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Environment | \`$DEPLOYMENT_ENVIRONMENT\` |"
+            echo "| GCP project | \`$PROJECT_ID\` |"
+            echo "| Cloud Run service | \`$SERVICE\` |"
+            echo "| Region | \`$REGION\` |"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| Git SHA | \`$GIT_SHA\` |"
+            echo "| Cloud Run URL | $SERVICE_URL |"
+          } >> "$GITHUB_STEP_SUMMARY"
