@@ -93,7 +93,7 @@ jobs:
           REGION: ${{ vars.GCP_REGION }}
           SERVICE: ${{ inputs.service }}
           ARTIFACT_REGISTRY: ${{ vars.GCP_ARTIFACT_REGISTRY }}
-          DOCKER_CONTEXT: ${{ inputs.docker_context }}
+          BUILD_CONTEXT: ${{ inputs.docker_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
           WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
           DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
@@ -108,7 +108,7 @@ jobs:
             REGION
             SERVICE
             ARTIFACT_REGISTRY
-            DOCKER_CONTEXT
+            BUILD_CONTEXT
             DOCKERFILE
             WORKLOAD_IDENTITY_PROVIDER
             DEPLOY_SERVICE_ACCOUNT
@@ -179,8 +179,8 @@ jobs:
             exit 1
           fi
 
-          if [[ ! -d "$DOCKER_CONTEXT" ]]; then
-            echo "::error title=Invalid Docker context::docker_context does not exist or is not a directory: $DOCKER_CONTEXT"
+          if [[ ! -d "$BUILD_CONTEXT" ]]; then
+            echo "::error title=Invalid Docker context::docker_context does not exist or is not a directory: $BUILD_CONTEXT"
             exit 1
           fi
 
@@ -253,9 +253,9 @@ jobs:
       - name: Build immutable container image
         shell: bash
         env:
-          DOCKER_CONTEXT: ${{ inputs.docker_context }}
+          BUILD_CONTEXT: ${{ inputs.docker_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
-        run: docker build --file "$DOCKERFILE" --tag "$IMAGE" "$DOCKER_CONTEXT"
+        run: docker build --file "$DOCKERFILE" --tag "$IMAGE" "$BUILD_CONTEXT"
 
       - name: Push immutable container image
         shell: bash
