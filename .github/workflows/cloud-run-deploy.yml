@@ -8,8 +8,26 @@ on:
         required: true
         type: string
       service:
-        description: Cloud Run service name and container image name.
+        description: Cloud Run service name. Also the container image name unless image_name or image is supplied.
         required: true
+        type: string
+      image_name:
+        description: >-
+          Image name used to derive the git-SHA image reference. Defaults to the
+          service name. Set this when several services run the SAME artifact with
+          different configuration (for example lane-split Data Plane services):
+          the image is built once and reused instead of being duplicated per
+          service.
+        required: false
+        default: ""
+        type: string
+      image:
+        description: >-
+          Full image reference to deploy. When set, no image is built or pushed,
+          so a release built once can be deployed to several services. The
+          reference must already exist in Artifact Registry.
+        required: false
+        default: ""
         type: string
       docker_context:
         description: Docker build context, relative to the repository root.
@@ -102,6 +120,8 @@ jobs:
           PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_REGION }}
           SERVICE: ${{ inputs.service }}
+          IMAGE_NAME_INPUT: ${{ inputs.image_name }}
+          IMAGE_INPUT: ${{ inputs.image }}
           ARTIFACT_REGISTRY: ${{ vars.GCP_ARTIFACT_REGISTRY }}
           BUILD_CONTEXT: ${{ inputs.docker_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
@@ -117,9 +137,6 @@ jobs:
             PROJECT_ID
             REGION
             SERVICE
-            ARTIFACT_REGISTRY
-            BUILD_CONTEXT
-            DOCKERFILE
             WORKLOAD_IDENTITY_PROVIDER
             DEPLOY_SERVICE_ACCOUNT
           )
@@ -148,11 +165,6 @@ jobs:
 
           if [[ ! "$SERVICE" =~ ^[a-z]([a-z0-9-]{0,47}[a-z0-9])?$ ]]; then
             echo "::error title=Invalid service::service must be a valid Cloud Run service name (lowercase letters, numbers, and hyphens; at most 49 characters)."
-            exit 1
-          fi
-
-          if [[ ! "$ARTIFACT_REGISTRY" =~ ^[a-z0-9]([a-z0-9._-]{0,61}[a-z0-9])?$ ]]; then
-            echo "::error title=Invalid Artifact Registry repository::artifact_registry must be a 1-63 character lowercase repository name, not a path."
             exit 1
           fi
 
@@ -189,17 +201,43 @@ jobs:
             exit 1
           fi
 
-          if [[ ! -d "$BUILD_CONTEXT" ]]; then
-            echo "::error title=Invalid Docker context::docker_context does not exist or is not a directory: $BUILD_CONTEXT"
-            exit 1
-          fi
+          # A supplied image means the artifact already exists in Artifact
+          # Registry, so this run deploys configuration only. Otherwise the
+          # image is built here, under either the service name or an explicit
+          # image name.
+          if [[ -n "$IMAGE_INPUT" ]]; then
+            image="$IMAGE_INPUT"
+            build_required=false
+          else
+            if [[ ! "$ARTIFACT_REGISTRY" =~ ^[a-z0-9]([a-z0-9._-]{0,61}[a-z0-9])?$ ]]; then
+              echo "::error title=Invalid Artifact Registry repository::artifact_registry must be a 1-63 character lowercase repository name, not a path."
+              exit 1
+            fi
 
-          if [[ ! -f "$DOCKERFILE" ]]; then
-            echo "::error title=Invalid Dockerfile::dockerfile does not exist or is not a file: $DOCKERFILE"
-            exit 1
-          fi
+            image_name="${IMAGE_NAME_INPUT:-$SERVICE}"
+            if [[ ! "$image_name" =~ ^[a-z0-9]([a-z0-9._-]{0,61}[a-z0-9])?$ ]]; then
+              echo "::error title=Invalid image name::image_name must be a 1-63 character lowercase repository image name, not a path."
+              exit 1
+            fi
 
-          image="$REGION-docker.pkg.dev/$PROJECT_ID/$ARTIFACT_REGISTRY/$SERVICE:$GITHUB_SHA"
+            if [[ -z "${BUILD_CONTEXT//[[:space:]]/}" || -z "${DOCKERFILE//[[:space:]]/}" ]]; then
+              echo "::error title=Invalid image build::docker_context and dockerfile must not be empty when no explicit image is supplied."
+              exit 1
+            fi
+
+            if [[ ! -d "$BUILD_CONTEXT" ]]; then
+              echo "::error title=Invalid Docker context::docker_context does not exist or is not a directory: $BUILD_CONTEXT"
+              exit 1
+            fi
+
+            if [[ ! -f "$DOCKERFILE" ]]; then
+              echo "::error title=Invalid Dockerfile::dockerfile does not exist or is not a file: $DOCKERFILE"
+              exit 1
+            fi
+
+            image="$REGION-docker.pkg.dev/$PROJECT_ID/$ARTIFACT_REGISTRY/$image_name:$GITHUB_SHA"
+            build_required=true
+          fi
 
           {
             printf 'project_id=%s\n' "$PROJECT_ID"
@@ -209,33 +247,34 @@ jobs:
             printf 'deploy_service_account=%s\n' "$DEPLOY_SERVICE_ACCOUNT"
             printf 'runtime_service_account=%s\n' "$RUNTIME_SERVICE_ACCOUNT"
             printf 'image=%s\n' "$image"
+            printf 'build_required=%s\n' "$build_required"
           } >> "$GITHUB_OUTPUT"
 
           printf 'IMAGE=%s\n' "$image" >> "$GITHUB_ENV"
 
       - name: Application setup
-        if: ${{ inputs.setup_command != '' }}
+        if: ${{ inputs.image == '' && inputs.setup_command != '' }}
         shell: bash
         env:
           APP_COMMAND: ${{ inputs.setup_command }}
         run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
 
       - name: Lint and static validation
-        if: ${{ inputs.lint_command != '' }}
+        if: ${{ inputs.image == '' && inputs.lint_command != '' }}
         shell: bash
         env:
           APP_COMMAND: ${{ inputs.lint_command }}
         run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
 
       - name: Run application tests
-        if: ${{ inputs.test_command != '' }}
+        if: ${{ inputs.image == '' && inputs.test_command != '' }}
         shell: bash
         env:
           APP_COMMAND: ${{ inputs.test_command }}
         run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
 
       - name: Pre-build validation
-        if: ${{ inputs.pre_build_command != '' }}
+        if: ${{ inputs.image == '' && inputs.pre_build_command != '' }}
         shell: bash
         env:
           APP_COMMAND: ${{ inputs.pre_build_command }}
@@ -255,12 +294,14 @@ jobs:
           project_id: ${{ steps.configuration.outputs.project_id }}
 
       - name: Configure Docker for Artifact Registry
+        if: ${{ steps.configuration.outputs.build_required == 'true' }}
         shell: bash
         env:
           REGISTRY_HOST: ${{ steps.configuration.outputs.region }}-docker.pkg.dev
         run: gcloud auth configure-docker "$REGISTRY_HOST" --quiet
 
       - name: Prepare private registry configuration
+        if: ${{ steps.configuration.outputs.build_required == 'true' }}
         shell: bash
         env:
           APP_NPMRC: ${{ secrets.NPMRC }}
@@ -278,6 +319,7 @@ jobs:
           echo "::add-mask::$APP_NPMRC"
 
       - name: Build immutable container image
+        if: ${{ steps.configuration.outputs.build_required == 'true' }}
         shell: bash
         env:
           DOCKER_BUILDKIT: '1'
@@ -287,6 +329,7 @@ jobs:
         run: docker build --file "$DOCKERFILE" --tag "$IMAGE" $BUILD_SECRET_FLAG "$BUILD_CONTEXT"
 
       - name: Push immutable container image
+        if: ${{ steps.configuration.outputs.build_required == 'true' }}
         shell: bash
         run: docker push "$IMAGE"
 

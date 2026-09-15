@@ -22,7 +22,9 @@ name out of application repositories.
 | Input | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `environment` | Yes | — | GitHub Environment and deployment label: `dev`, `stage`, or `production` |
-| `service` | Yes | — | Cloud Run service and image name |
+| `service` | Yes | — | Cloud Run service name; also the image name unless `image_name` or `image` is supplied |
+| `image_name` | No | empty | Image name used to derive `<registry>/<image_name>:<sha>`. Defaults to `service`. Set it when several services run the same artifact with different configuration, so the image is built once instead of duplicated per service |
+| `image` | No | empty | Full image reference to deploy. When set, the image is neither built nor pushed, so one built release can be deployed to several services. The reference must already exist in Artifact Registry |
 | `docker_context` | No | `.` | Docker build context |
 | `dockerfile` | No | `./Dockerfile` | Dockerfile path |
 | `runtime_service_account_variable` | No | empty | Name of the GitHub Environment variable holding the runtime service account |
@@ -215,8 +217,10 @@ The runtime account, for example `product-os-api-runtime@my-project.iam.gservice
 Every image is named:
 
 ```text
-<region>-docker.pkg.dev/<project>/<registry>/<service>:<github.sha>
+<region>-docker.pkg.dev/<project>/<registry>/<image_name>:<github.sha>
 ```
+
+`image_name` defaults to `service`, so the single-service case is unchanged. Supply it explicitly when one artifact serves more than one service — for example Data Plane services split by lane and by public/internal trust, which run identical images under different configuration. Supply `image` instead to deploy an already-built reference without rebuilding, which is the pattern that keeps one release SHA pinned across several services.
 
 The Git SHA tag provides a traceable, immutable deployment identifier; the workflow never deploys `latest`. Configure Artifact Registry tag immutability to prevent an existing SHA tag from being overwritten.
 
