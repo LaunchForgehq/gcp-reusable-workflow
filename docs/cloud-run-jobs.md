@@ -1,18 +1,41 @@
 # Cloud Run reusable job workflow
 
-The workflow at `.github/workflows/cloud-run-job.yml` creates or updates a
-Cloud Run **Job** and then executes it synchronously, failing the pipeline when
+The workflow at `.github/workflows/cloud-run-job.yml` updates a Cloud Run
+**Job**'s image and then executes it synchronously, failing the pipeline when
 the execution fails. It is the migration counterpart to the Cloud Run service
 deployment workflow and exists because a job lifecycle is not a service
 lifecycle: a job is finite, has no traffic or ingress, and its exit status is a
 release gate rather than a rollout.
+
+## Authority split
+
+This workflow owns the job **revision** and its **execution**. It owns nothing
+else about the job.
+
+| Owner | Owns |
+| --- | --- |
+| Infrastructure (Terraform, or whatever declares the job in the calling project) | service account, environment variables, secret bindings, container command and args, CPU/memory, retry policy, task count, parallelism |
+| This workflow | which immutable image the job runs, and when it runs |
+
+Two consequences follow, and both are deliberate:
+
+- **The workflow will not create a job.** A job that first appears during a
+  release carries an envelope no review ever saw, so an unknown job name is a
+  hard failure that names the missing infrastructure.
+- **The workflow sends no envelope fields.** There are no `env_vars`,
+  `secret_refs`, `command`, `args`, `job_flags`, or service-account inputs.
+  They existed until they were recognized as a second infrastructure
+  authority: a migration caller could rewrite a reviewed envelope, and the
+  rewritten configuration would silently serve until the next apply reverted
+  it. An image update uses `gcloud run jobs update`, a read-modify-write of the
+  existing spec, so every field the command does not name is preserved.
 
 Its execution path is:
 
 ```text
 checkout -> validate -> (optional setup/lint/tests/pre-build)
          -> GitHub OIDC/WIF authentication -> (optional Docker build + Artifact Registry push)
-         -> create/update job -> execute -> wait -> assert result
+         -> verify job exists -> update job image -> execute -> wait -> assert result
          -> surface execution logs -> execution summary
 ```
 
@@ -23,15 +46,10 @@ checkout -> validate -> (optional setup/lint/tests/pre-build)
 | `environment` | Yes | — | GitHub Environment and deployment label: `dev`, `stage`, or `production` |
 | `job` | Yes | — | Cloud Run Job name |
 | `image_name` | No | `job` | Image name used to derive the git-SHA image reference |
-| `image` | No | empty | Full image reference to run; when set, nothing is built or pushed |
+| `image` | No | empty | Full image reference to run; when set, nothing is built or pushed. Must end in a 40-character git-SHA tag |
 | `docker_context` | No | `.` | Docker build context (build path only) |
 | `dockerfile` | No | `./Dockerfile` | Dockerfile path (build path only) |
-| `runtime_service_account_variable` | No | empty | GitHub Environment variable holding the job runtime service account |
-| `env_vars` | No | empty | Newline-separated non-sensitive `KEY=VALUE` settings |
-| `secret_refs` | No | empty | Newline-separated `KEY=SECRET:VERSION` references; `KEY` may be an absolute mount path |
-| `command` | No | empty | Container entrypoint override |
-| `args` | No | empty | Newline-separated argument override |
-| `job_flags` | No | empty | Additional `gcloud run jobs deploy` flags |
+| `build_args` | No | empty | Newline-separated `NAME=VALUE` entries passed to `docker build --build-arg`. Configures the artifact, which the release owns; never the Cloud Run envelope, which infrastructure owns |
 | `timeout_minutes` | No | `20` | Workflow job timeout |
 | `setup_command` / `lint_command` / `test_command` / `pre_build_command` | No | empty | Validation gates, run only on the build path |
 
@@ -44,18 +62,15 @@ checkout -> validate -> (optional setup/lint/tests/pre-build)
 | `image` | Image reference the job was executed with |
 | `execution_name` | Cloud Run job execution name |
 
-`env_vars` and `secret_refs` are sent to Cloud Run with a custom `@` delimiter,
-so values containing commas survive intact. They are applied with set
-semantics for the named keys; the job definition keeps any other existing
-configuration.
-
 ## Failure semantics
 
 The workflow fails when:
 
 - required deployment configuration is missing or malformed;
+- an explicitly supplied image is not pinned to a 40-character git-SHA tag;
 - an image build or push fails;
-- the job cannot be created or updated;
+- the job does not exist, because the calling infrastructure has not been applied;
+- the job image cannot be updated;
 - `gcloud run jobs execute --wait` returns a non-zero status;
 - the execution reports `failedCount != 0` or `succeededCount == 0`.
 
@@ -98,18 +113,12 @@ jobs:
       job: launchforge-migrate-cp
       image_name: launchforge-control-plane
       dockerfile: ./deploy/production/control-plane.Dockerfile
-      runtime_service_account_variable: GCP_MIGRATION_RUNTIME_SERVICE_ACCOUNT
-      env_vars: |
-        NODE_ENV=production
-        MIGRATION_TARGET=control-plane
-      secret_refs: |
-        DATABASE_URL=launchforge-cp-database-url:latest
-      job_flags: >-
-        --cpu=1
-        --memory=1Gi
-        --max-retries=0
-        --task-timeout=900
 ```
+
+The runtime service account, environment variables, secret bindings, command,
+args, CPU, memory, retry policy, and task count are **not** supplied here. They
+belong to the infrastructure that declares the job. A caller that needs a new
+environment variable adds it to the job definition, not to this workflow.
 
 Callers that already build the image elsewhere pass `image` and omit the build
 inputs:

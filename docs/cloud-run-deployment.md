@@ -51,6 +51,20 @@ They are non-sensitive deployment metadata, not application credentials.
 | `GCP_DEPLOY_SERVICE_ACCOUNT` | Dedicated service account impersonated for push/deploy |
 | `GCP_*_RUNTIME_SERVICE_ACCOUNT` | Runtime service accounts, selected through `runtime_service_account_variable` |
 
+### Envelope versus revision
+
+`runtime_service_account_variable`, `env_vars`, `secret_refs`, and
+`cloud_run_flags` all write the Cloud Run **envelope**, so a caller that supplies
+them owns service configuration. A caller whose service is declared in
+infrastructure (for example Terraform) must pass none of them: the envelope is
+the infrastructure's, and the deployment owns only the immutable image. Supplying
+both creates two authorities over one object, where an apply reverts the
+deployment and a deployment overwrites the apply.
+
+The inputs remain available for callers that have no infrastructure layer. They
+are the reason this workflow is a general-purpose library rather than a
+single-project pipeline.
+
 ### Optional secret
 
 | Secret | Required | Purpose |

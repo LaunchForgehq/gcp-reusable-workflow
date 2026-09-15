@@ -10,12 +10,30 @@ name: Run Cloud Run Job
 #
 # This workflow therefore owns ONLY the job lifecycle:
 #
-#   validate -> (optional build/push) -> create/update job -> execute
+#   validate -> (optional build/push) -> update job image -> execute
 #            -> wait -> assert non-zero-free result -> surface logs + run identity
 #
 # The caller supplies configuration. No GCP mechanic (authentication, image
 # build, Artifact Registry push, job deployment, execution) is duplicated in a
 # caller repository.
+#
+# AUTHORITY SPLIT (ADR 0037). This workflow owns the job REVISION and its
+# EXECUTION. Terraform owns the job ENVELOPE.
+#
+#   Terraform: service account, env vars, secret bindings, container command
+#              and args, CPU/memory, retry policy, task count, parallelism
+#   This workflow: which immutable image the job runs, and when it runs
+#
+# That is why there are no `env_vars`, `secret_refs`, `command`, `args`,
+# `job_flags`, or service-account inputs below. They used to exist, and they
+# were a second infrastructure authority: a migration caller could rewrite the
+# reviewed envelope, and the rewritten configuration would silently serve until
+# the next `terraform apply` reverted it. The job is created by Terraform; this
+# workflow refuses to create one, because a job that appears for the first time
+# during a release has an envelope nobody reviewed.
+#
+# The image is applied with `gcloud run jobs update`, which is a read-modify-write
+# of the existing spec: every field this workflow does not name is preserved.
 
 on:
   workflow_call:
@@ -34,7 +52,7 @@ on:
         default: ''
         type: string
       image:
-        description: Full image reference to run. When set, no image is built or pushed.
+        description: Full image reference to run. When set, no image is built or pushed. Must carry an immutable git-SHA tag.
         required: false
         default: ''
         type: string
@@ -48,33 +66,15 @@ on:
         required: false
         default: ./Dockerfile
         type: string
-      runtime_service_account_variable:
-        description: Name of the GitHub Environment variable containing the job runtime service account.
-        required: false
-        default: ''
-        type: string
-      env_vars:
-        description: Non-sensitive job environment variables as newline-separated KEY=VALUE entries.
-        required: false
-        default: ''
-        type: string
-      secret_refs:
-        description: Secret Manager references as newline-separated KEY=SECRET:VERSION entries. KEY may be an absolute mount path.
-        required: false
-        default: ''
-        type: string
-      command:
-        description: Optional container entrypoint override for the job.
-        required: false
-        default: ''
-        type: string
-      args:
-        description: Optional container argument override, newline-separated.
-        required: false
-        default: ''
-        type: string
-      job_flags:
-        description: Additional flags accepted by `gcloud run jobs deploy`.
+      build_args:
+        description: >-
+          Optional Docker build arguments as newline-separated NAME=VALUE
+          entries, passed to `docker build --build-arg`. Intended for
+          non-secret values that must exist at BUILD time because the image
+          bakes them in (for example a release version). This configures the
+          ARTIFACT, which the release owns - never the Cloud Run envelope,
+          which Terraform owns. Never use it for credentials: build arguments
+          are visible in image metadata.
         required: false
         default: ''
         type: string
@@ -150,10 +150,6 @@ jobs:
           DOCKERFILE: ${{ inputs.dockerfile }}
           WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
           DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
-          RUNTIME_SERVICE_ACCOUNT_VARIABLE: ${{ inputs.runtime_service_account_variable }}
-          RUNTIME_SERVICE_ACCOUNT: ${{ inputs.runtime_service_account_variable != '' && vars[inputs.runtime_service_account_variable] || '' }}
-          RUN_COMMAND: ${{ inputs.command }}
-          RUN_ARGS: ${{ inputs.args }}
         run: |
           set -euo pipefail
 
@@ -196,6 +192,14 @@ jobs:
           if [[ -n "$IMAGE_INPUT" ]]; then
             image="$IMAGE_INPUT"
             build_required=false
+
+            # An explicit image must be immutable. A branch or `latest` tag
+            # makes a migration unreproducible and lets the executed bytes
+            # differ from the reviewed release.
+            if [[ ! "$image" =~ :[0-9a-f]{40}$ ]]; then
+              echo "::error title=Mutable job image::image must end in a 40-character git-SHA tag, got '$image'."
+              exit 1
+            fi
           else
             image_name="${IMAGE_NAME_INPUT:-$JOB}"
             if [[ ! "$ARTIFACT_REGISTRY" =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
@@ -210,17 +214,11 @@ jobs:
             build_required=true
           fi
 
-          if [[ -n "${RUN_ARGS//[[:space:]]/}" && -z "${RUN_COMMAND//[[:space:]]/}" ]]; then
-            echo "::error title=Invalid command::args were supplied without a container entrypoint override. Set command as well."
-            exit 1
-          fi
-
           {
             printf 'project_id=%s\n' "$PROJECT_ID"
             printf 'region=%s\n' "$REGION"
             printf 'workload_identity_provider=%s\n' "$WORKLOAD_IDENTITY_PROVIDER"
             printf 'deploy_service_account=%s\n' "$DEPLOY_SERVICE_ACCOUNT"
-            printf 'runtime_service_account=%s\n' "$RUNTIME_SERVICE_ACCOUNT"
             printf 'image=%s\n' "$image"
             printf 'build_required=%s\n' "$build_required"
           } >> "$GITHUB_OUTPUT"
@@ -301,72 +299,83 @@ jobs:
           BUILD_SECRET_FLAG: ${{ env.DOCKER_BUILD_SECRET_FLAG }}
           BUILD_CONTEXT: ${{ inputs.docker_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
-        run: docker build --file "$DOCKERFILE" --tag "$JOB_IMAGE" $BUILD_SECRET_FLAG "$BUILD_CONTEXT"
+          BUILD_ARGS: ${{ inputs.build_args }}
+        run: |
+          set -euo pipefail
+
+          build_arg_flags=()
+
+          if [[ -n "${BUILD_ARGS//[[:space:]]/}" ]]; then
+            while IFS= read -r entry; do
+              [[ -z "${entry//[[:space:]]/}" ]] && continue
+
+              if [[ ! "$entry" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+                echo "::error title=Invalid build argument::build_args entries must be NAME=VALUE. Got: $entry"
+                exit 1
+              fi
+
+              build_arg_flags+=(--build-arg "$entry")
+            done <<< "$BUILD_ARGS"
+          fi
+
+          docker build \
+            --file "$DOCKERFILE" \
+            --tag "$JOB_IMAGE" \
+            ${build_arg_flags[@]+"${build_arg_flags[@]}"} \
+            $BUILD_SECRET_FLAG \
+            "$BUILD_CONTEXT"
 
       - name: Push immutable container image
         if: ${{ steps.configuration.outputs.build_required == 'true' }}
         shell: bash
         run: docker push "$JOB_IMAGE"
 
-      - name: Deploy Cloud Run job
+      # Terraform creates the job and owns its envelope. This workflow refuses
+      # to create one: a job that first appears during a release would carry an
+      # envelope no review ever saw.
+      - name: Verify the job envelope exists
+        id: envelope
+        shell: bash
+        env:
+          PROJECT_ID: ${{ steps.configuration.outputs.project_id }}
+          REGION: ${{ steps.configuration.outputs.region }}
+          JOB: ${{ inputs.job }}
+        run: |
+          set -euo pipefail
+
+          if ! gcloud run jobs describe "$JOB" \
+              --project="$PROJECT_ID" \
+              --region="$REGION" \
+              --format='value(metadata.name)' > /dev/null 2>&1; then
+            echo "::error title=Unknown Cloud Run job::Job '$JOB' does not exist in $PROJECT_ID/$REGION. Terraform owns job creation; apply the production infrastructure root before running migrations."
+            exit 1
+          fi
+
+          echo "Job $JOB exists; its envelope is Terraform-owned."
+
+      # Image-only update. `gcloud run jobs update` is a read-modify-write of
+      # the existing job spec, so every field this command does not name -- the
+      # service account, environment variables, secret bindings, command, args,
+      # CPU/memory, retry policy, task count -- is preserved exactly as
+      # Terraform declared it. A migration can therefore change the bytes and
+      # nothing else.
+      - name: Update job image
         id: deploy
         shell: bash
         env:
           PROJECT_ID: ${{ steps.configuration.outputs.project_id }}
           REGION: ${{ steps.configuration.outputs.region }}
           JOB: ${{ inputs.job }}
-          RUNTIME_SERVICE_ACCOUNT: ${{ steps.configuration.outputs.runtime_service_account }}
-          ENV_VARS: ${{ inputs.env_vars }}
-          SECRET_REFS: ${{ inputs.secret_refs }}
-          RUN_COMMAND: ${{ inputs.command }}
-          RUN_ARGS: ${{ inputs.args }}
-          JOB_FLAGS: ${{ inputs.job_flags }}
         run: |
           set -euo pipefail
 
-          deploy_args=(
-            run jobs deploy "$JOB"
-            --project="$PROJECT_ID"
-            --region="$REGION"
-            --image="$JOB_IMAGE"
+          gcloud run jobs update "$JOB" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --image="$JOB_IMAGE" \
             --quiet
-          )
 
-          if [[ -n "${RUNTIME_SERVICE_ACCOUNT//[[:space:]]/}" ]]; then
-            deploy_args+=(--service-account="$RUNTIME_SERVICE_ACCOUNT")
-          fi
-
-          # Cloud Run treats commas as separators, so a custom delimiter keeps
-          # values that legitimately contain commas intact.
-          if [[ -n "${ENV_VARS//[[:space:]]/}" ]]; then
-            env_spec="$(printf '%s\n' "$ENV_VARS" | sed '/^[[:space:]]*$/d' | paste -sd'@' -)"
-            deploy_args+=(--set-env-vars="^@^${env_spec}")
-          fi
-
-          if [[ -n "${SECRET_REFS//[[:space:]]/}" ]]; then
-            secret_spec="$(printf '%s\n' "$SECRET_REFS" | sed '/^[[:space:]]*$/d' | paste -sd'@' -)"
-            deploy_args+=(--set-secrets="^@^${secret_spec}")
-          fi
-
-          if [[ -n "${RUN_COMMAND//[[:space:]]/}" ]]; then
-            deploy_args+=(--command="$RUN_COMMAND")
-          fi
-
-          if [[ -n "${RUN_ARGS//[[:space:]]/}" ]]; then
-            while IFS= read -r argument; do
-              [[ -z "${argument//[[:space:]]/}" ]] && continue
-              deploy_args+=(--args="$argument")
-            done <<< "$RUN_ARGS"
-          fi
-
-          if [[ -n "${JOB_FLAGS//[[:space:]]/}" ]]; then
-            while IFS= read -r flag; do
-              [[ -z "${flag//[[:space:]]/}" ]] && continue
-              deploy_args+=("$flag")
-            done <<< "$JOB_FLAGS"
-          fi
-
-          gcloud "${deploy_args[@]}"
+          printf 'Job %s image set to %s\n' "$JOB" "$JOB_IMAGE"
 
       - name: Execute Cloud Run job
         id: execute
