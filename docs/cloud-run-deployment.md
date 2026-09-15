@@ -14,25 +14,45 @@ All configured validation commands run before Google Cloud authentication and be
 
 ## Inputs and output
 
+Callers pass application-specific inputs; environment-specific infrastructure
+configuration is read from the selected GitHub Environment (see the next
+section). This split keeps a project ID, WIF provider, or Artifact Registry
+name out of application repositories.
+
 | Input | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `environment` | Yes | — | GitHub Environment and deployment label: `dev`, `stage`, or `production` |
-| `project_id` | Yes | — | Target Google Cloud project ID |
-| `region` | No | `us-central1` | Artifact Registry and Cloud Run region |
 | `service` | Yes | — | Cloud Run service and image name |
-| `artifact_registry` | Yes | — | Artifact Registry repository name |
 | `docker_context` | No | `.` | Docker build context |
 | `dockerfile` | No | `./Dockerfile` | Dockerfile path |
-| `workload_identity_provider` | Yes | — | Full WIF provider resource name, using the project number |
-| `deploy_service_account` | Yes | — | Dedicated service account impersonated for push/deploy |
-| `runtime_service_account` | No | empty | Service account attached to the Cloud Run revision |
+| `runtime_service_account_variable` | No | empty | Name of the GitHub Environment variable holding the runtime service account |
 | `env_vars` | No | empty | Newline-separated non-sensitive `KEY=VALUE` settings |
-| `secret_refs` | No | empty | Newline-separated Secret Manager `KEY=SECRET:VERSION` references |
+| `secret_refs` | No | empty | Newline-separated Secret Manager `KEY=SECRET:VERSION` references. `KEY` may be an absolute mount path |
 | `cloud_run_flags` | No | empty | Additional `gcloud run deploy` flags |
 | `setup_command` | No | empty | Dependency installation or application setup |
 | `lint_command` | No | empty | Lint/static validation |
 | `test_command` | No | empty | Application tests |
 | `pre_build_command` | No | empty | Final validation/application build before Docker build |
+
+### GitHub Environment variables
+
+The workflow reads these from the GitHub Environment named by `environment`.
+They are non-sensitive deployment metadata, not application credentials.
+
+| Variable | Purpose |
+| --- | --- |
+| `GCP_PROJECT_ID` | Target Google Cloud project ID |
+| `GCP_REGION` | Artifact Registry and Cloud Run region (for example `us-central1`) |
+| `GCP_ARTIFACT_REGISTRY` | Artifact Registry repository name |
+| `GCP_WIF_PROVIDER` | Full Workload Identity Federation provider resource name, using the project number |
+| `GCP_DEPLOY_SERVICE_ACCOUNT` | Dedicated service account impersonated for push/deploy |
+| `GCP_*_RUNTIME_SERVICE_ACCOUNT` | Runtime service accounts, selected through `runtime_service_account_variable` |
+
+### Optional secret
+
+| Secret | Required | Purpose |
+| --- | --- | --- |
+| `NPMRC` | No | `.npmrc` content for private package registries. It is written to a temporary file and mounted into the image build as BuildKit secret `id: npmrc`; the Dockerfile must consume it with `RUN --mount=type=secret,id=npmrc,dst=/root/.npmrc ...`. Without it, an image whose install step resolves private packages cannot be built |
 
 The workflow exposes `service_url`. A caller can read it as `needs.deploy.outputs.service_url` when a downstream job declares `needs: deploy`.
 
@@ -56,18 +76,18 @@ permissions:
 
 jobs:
   deploy:
-    uses: <OWNER>/<WORKFLOW_REPO>/.github/workflows/cloud-run-deploy.yml@v1
+    # Pin an immutable commit SHA (or a published major tag) so a caller cannot
+    # be changed underneath a release.
+    uses: <OWNER>/<WORKFLOW_REPO>/.github/workflows/cloud-run-deploy.yml@<SHA>
+    secrets:
+      # Only needed when the image install step resolves private packages.
+      NPMRC: ${{ secrets.APP_NPMRC }}
     with:
       environment: stage
-      project_id: my-stage-project
-      region: us-central1
-      artifact_registry: apps
       service: product-os-api
       docker_context: .
       dockerfile: ./Dockerfile
-      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
-      deploy_service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
-      runtime_service_account: product-os-api-runtime@my-stage-project.iam.gserviceaccount.com
+      runtime_service_account_variable: GCP_API_RUNTIME_SERVICE_ACCOUNT
       setup_command: corepack enable && pnpm install --frozen-lockfile
       lint_command: pnpm lint
       test_command: pnpm test

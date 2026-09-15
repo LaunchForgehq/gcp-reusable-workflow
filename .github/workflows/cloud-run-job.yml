@@ -1,0 +1,483 @@
+name: Run Cloud Run Job
+
+# Reusable Cloud Run JOB workflow.
+#
+# Cloud Run services and Cloud Run jobs have different lifecycles. A service is
+# long-running and receives traffic; a job is a finite, one-shot execution whose
+# exit status is the release gate for schema migrations. Keeping the two in one
+# multipurpose pipeline would make the service pipeline harder to reason about
+# and would let a migration run be retried as if it were a deployment.
+#
+# This workflow therefore owns ONLY the job lifecycle:
+#
+#   validate -> (optional build/push) -> create/update job -> execute
+#            -> wait -> assert non-zero-free result -> surface logs + run identity
+#
+# The caller supplies configuration. No GCP mechanic (authentication, image
+# build, Artifact Registry push, job deployment, execution) is duplicated in a
+# caller repository.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub deployment environment (dev, stage, or production).
+        required: true
+        type: string
+      job:
+        description: Cloud Run Job name.
+        required: true
+        type: string
+      image_name:
+        description: Image name used to derive the git-SHA image reference. Defaults to the job name.
+        required: false
+        default: ''
+        type: string
+      image:
+        description: Full image reference to run. When set, no image is built or pushed.
+        required: false
+        default: ''
+        type: string
+      docker_context:
+        description: Docker build context, relative to the repository root.
+        required: false
+        default: .
+        type: string
+      dockerfile:
+        description: Dockerfile path, relative to the repository root.
+        required: false
+        default: ./Dockerfile
+        type: string
+      runtime_service_account_variable:
+        description: Name of the GitHub Environment variable containing the job runtime service account.
+        required: false
+        default: ''
+        type: string
+      env_vars:
+        description: Non-sensitive job environment variables as newline-separated KEY=VALUE entries.
+        required: false
+        default: ''
+        type: string
+      secret_refs:
+        description: Secret Manager references as newline-separated KEY=SECRET:VERSION entries. KEY may be an absolute mount path.
+        required: false
+        default: ''
+        type: string
+      command:
+        description: Optional container entrypoint override for the job.
+        required: false
+        default: ''
+        type: string
+      args:
+        description: Optional container argument override, newline-separated.
+        required: false
+        default: ''
+        type: string
+      job_flags:
+        description: Additional flags accepted by `gcloud run jobs deploy`.
+        required: false
+        default: ''
+        type: string
+      timeout_minutes:
+        description: Workflow job timeout in minutes.
+        required: false
+        default: 20
+        type: number
+      setup_command:
+        description: Optional application setup or dependency installation command (build path only).
+        required: false
+        default: ''
+        type: string
+      lint_command:
+        description: Optional lint or static-validation command (build path only).
+        required: false
+        default: ''
+        type: string
+      test_command:
+        description: Optional application test command (build path only).
+        required: false
+        default: ''
+        type: string
+      pre_build_command:
+        description: Optional final validation or application build command (build path only).
+        required: false
+        default: ''
+        type: string
+    secrets:
+      NPMRC:
+        description: Optional user-level .npmrc content for private package registries, mounted as a BuildKit secret.
+        required: false
+    outputs:
+      image:
+        description: Image reference the job was executed with.
+        value: ${{ jobs.run.outputs.image }}
+      execution_name:
+        description: Cloud Run job execution name.
+        value: ${{ jobs.run.outputs.execution_name }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  run:
+    name: Run migration job
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    concurrency:
+      group: cloud-run-job-${{ github.repository }}-${{ inputs.environment }}-${{ inputs.job }}
+      cancel-in-progress: false
+    outputs:
+      image: ${{ steps.configuration.outputs.image }}
+      execution_name: ${{ steps.execute.outputs.execution_name }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Validate job configuration
+        id: configuration
+        shell: bash
+        env:
+          DEPLOYMENT_ENVIRONMENT: ${{ inputs.environment }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          JOB: ${{ inputs.job }}
+          IMAGE_NAME_INPUT: ${{ inputs.image_name }}
+          IMAGE_INPUT: ${{ inputs.image }}
+          ARTIFACT_REGISTRY: ${{ vars.GCP_ARTIFACT_REGISTRY }}
+          BUILD_CONTEXT: ${{ inputs.docker_context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WIF_PROVIDER }}
+          DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+          RUNTIME_SERVICE_ACCOUNT_VARIABLE: ${{ inputs.runtime_service_account_variable }}
+          RUNTIME_SERVICE_ACCOUNT: ${{ inputs.runtime_service_account_variable != '' && vars[inputs.runtime_service_account_variable] || '' }}
+          RUN_COMMAND: ${{ inputs.command }}
+          RUN_ARGS: ${{ inputs.args }}
+        run: |
+          set -euo pipefail
+
+          required_names=(
+            DEPLOYMENT_ENVIRONMENT
+            PROJECT_ID
+            REGION
+            JOB
+            WORKLOAD_IDENTITY_PROVIDER
+            DEPLOY_SERVICE_ACCOUNT
+          )
+
+          for name in "${required_names[@]}"; do
+            if [[ -z "${!name//[[:space:]]/}" ]]; then
+              echo "::error title=Invalid job configuration::${name} must not be empty."
+              exit 1
+            fi
+          done
+
+          if [[ ! "$DEPLOYMENT_ENVIRONMENT" =~ ^(dev|stage|production)$ ]]; then
+            echo "::error title=Invalid environment::environment must be one of: dev, stage, production."
+            exit 1
+          fi
+
+          if [[ ! "$REGION" =~ ^[a-z][a-z0-9-]*[a-z0-9]$ ]]; then
+            echo "::error title=Invalid region::region must be a valid Google Cloud region name."
+            exit 1
+          fi
+
+          if [[ ! "$PROJECT_ID" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]]; then
+            echo "::error title=Invalid project ID::project_id must be a standard 6-30 character Google Cloud project ID. Legacy domain-scoped project IDs are not supported."
+            exit 1
+          fi
+
+          if [[ ! "$JOB" =~ ^[a-z]([a-z0-9-]{0,47}[a-z0-9])?$ ]]; then
+            echo "::error title=Invalid job::job must be a valid Cloud Run job name (lowercase letters, numbers, and hyphens)."
+            exit 1
+          fi
+
+          if [[ -n "$IMAGE_INPUT" ]]; then
+            image="$IMAGE_INPUT"
+            build_required=false
+          else
+            image_name="${IMAGE_NAME_INPUT:-$JOB}"
+            if [[ ! "$ARTIFACT_REGISTRY" =~ ^[a-z]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+              echo "::error title=Invalid Artifact Registry::GCP_ARTIFACT_REGISTRY must be a valid Artifact Registry repository name."
+              exit 1
+            fi
+            if [[ -z "${BUILD_CONTEXT//[[:space:]]/}" || -z "${DOCKERFILE//[[:space:]]/}" ]]; then
+              echo "::error title=Invalid image build::docker_context and dockerfile must not be empty when no explicit image is supplied."
+              exit 1
+            fi
+            image="${REGION}-docker.pkg.dev/${PROJECT_ID}/${ARTIFACT_REGISTRY}/${image_name}:${GITHUB_SHA}"
+            build_required=true
+          fi
+
+          if [[ -n "${RUN_ARGS//[[:space:]]/}" && -z "${RUN_COMMAND//[[:space:]]/}" ]]; then
+            echo "::error title=Invalid command::args were supplied without a container entrypoint override. Set command as well."
+            exit 1
+          fi
+
+          {
+            printf 'project_id=%s\n' "$PROJECT_ID"
+            printf 'region=%s\n' "$REGION"
+            printf 'workload_identity_provider=%s\n' "$WORKLOAD_IDENTITY_PROVIDER"
+            printf 'deploy_service_account=%s\n' "$DEPLOY_SERVICE_ACCOUNT"
+            printf 'runtime_service_account=%s\n' "$RUNTIME_SERVICE_ACCOUNT"
+            printf 'image=%s\n' "$image"
+            printf 'build_required=%s\n' "$build_required"
+          } >> "$GITHUB_OUTPUT"
+
+          printf 'JOB_IMAGE=%s\n' "$image" >> "$GITHUB_ENV"
+
+          printf 'Migrating with image %s\n' "$image"
+
+      - name: Prepare private registry configuration
+        shell: bash
+        env:
+          APP_NPMRC: ${{ secrets.NPMRC }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${APP_NPMRC//[[:space:]]/}" ]]; then
+            echo "No private package registry configuration supplied."
+            exit 0
+          fi
+
+          umask 077
+          printf '%s\n' "$APP_NPMRC" > "$RUNNER_TEMP/npmrc"
+          printf 'DOCKER_BUILD_SECRET_FLAG=--secret=id=npmrc,src=%s\n' "$RUNNER_TEMP/npmrc" >> "$GITHUB_ENV"
+          echo "::add-mask::$APP_NPMRC"
+
+      - name: Application setup
+        if: ${{ inputs.image == '' && inputs.setup_command != '' }}
+        shell: bash
+        env:
+          APP_COMMAND: ${{ inputs.setup_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
+
+      - name: Lint and static validation
+        if: ${{ inputs.image == '' && inputs.lint_command != '' }}
+        shell: bash
+        env:
+          APP_COMMAND: ${{ inputs.lint_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
+
+      - name: Run application tests
+        if: ${{ inputs.image == '' && inputs.test_command != '' }}
+        shell: bash
+        env:
+          APP_COMMAND: ${{ inputs.test_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
+
+      - name: Pre-build validation
+        if: ${{ inputs.image == '' && inputs.pre_build_command != '' }}
+        shell: bash
+        env:
+          APP_COMMAND: ${{ inputs.pre_build_command }}
+        run: bash --noprofile --norc -eo pipefail -c "$APP_COMMAND"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ steps.configuration.outputs.project_id }}
+          workload_identity_provider: ${{ steps.configuration.outputs.workload_identity_provider }}
+          service_account: ${{ steps.configuration.outputs.deploy_service_account }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ steps.configuration.outputs.project_id }}
+
+      - name: Configure Docker for Artifact Registry
+        if: ${{ steps.configuration.outputs.build_required == 'true' }}
+        shell: bash
+        env:
+          REGISTRY_HOST: ${{ steps.configuration.outputs.region }}-docker.pkg.dev
+        run: gcloud auth configure-docker "$REGISTRY_HOST" --quiet
+
+      - name: Build immutable container image
+        if: ${{ steps.configuration.outputs.build_required == 'true' }}
+        shell: bash
+        env:
+          DOCKER_BUILDKIT: '1'
+          BUILD_SECRET_FLAG: ${{ env.DOCKER_BUILD_SECRET_FLAG }}
+          BUILD_CONTEXT: ${{ inputs.docker_context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: docker build --file "$DOCKERFILE" --tag "$JOB_IMAGE" $BUILD_SECRET_FLAG "$BUILD_CONTEXT"
+
+      - name: Push immutable container image
+        if: ${{ steps.configuration.outputs.build_required == 'true' }}
+        shell: bash
+        run: docker push "$JOB_IMAGE"
+
+      - name: Deploy Cloud Run job
+        id: deploy
+        shell: bash
+        env:
+          PROJECT_ID: ${{ steps.configuration.outputs.project_id }}
+          REGION: ${{ steps.configuration.outputs.region }}
+          JOB: ${{ inputs.job }}
+          RUNTIME_SERVICE_ACCOUNT: ${{ steps.configuration.outputs.runtime_service_account }}
+          ENV_VARS: ${{ inputs.env_vars }}
+          SECRET_REFS: ${{ inputs.secret_refs }}
+          RUN_COMMAND: ${{ inputs.command }}
+          RUN_ARGS: ${{ inputs.args }}
+          JOB_FLAGS: ${{ inputs.job_flags }}
+        run: |
+          set -euo pipefail
+
+          deploy_args=(
+            run jobs deploy "$JOB"
+            --project="$PROJECT_ID"
+            --region="$REGION"
+            --image="$JOB_IMAGE"
+            --quiet
+          )
+
+          if [[ -n "${RUNTIME_SERVICE_ACCOUNT//[[:space:]]/}" ]]; then
+            deploy_args+=(--service-account="$RUNTIME_SERVICE_ACCOUNT")
+          fi
+
+          # Cloud Run treats commas as separators, so a custom delimiter keeps
+          # values that legitimately contain commas intact.
+          if [[ -n "${ENV_VARS//[[:space:]]/}" ]]; then
+            env_spec="$(printf '%s\n' "$ENV_VARS" | sed '/^[[:space:]]*$/d' | paste -sd'@' -)"
+            deploy_args+=(--set-env-vars="^@^${env_spec}")
+          fi
+
+          if [[ -n "${SECRET_REFS//[[:space:]]/}" ]]; then
+            secret_spec="$(printf '%s\n' "$SECRET_REFS" | sed '/^[[:space:]]*$/d' | paste -sd'@' -)"
+            deploy_args+=(--set-secrets="^@^${secret_spec}")
+          fi
+
+          if [[ -n "${RUN_COMMAND//[[:space:]]/}" ]]; then
+            deploy_args+=(--command="$RUN_COMMAND")
+          fi
+
+          if [[ -n "${RUN_ARGS//[[:space:]]/}" ]]; then
+            while IFS= read -r argument; do
+              [[ -z "${argument//[[:space:]]/}" ]] && continue
+              deploy_args+=(--args="$argument")
+            done <<< "$RUN_ARGS"
+          fi
+
+          if [[ -n "${JOB_FLAGS//[[:space:]]/}" ]]; then
+            while IFS= read -r flag; do
+              [[ -z "${flag//[[:space:]]/}" ]] && continue
+              deploy_args+=("$flag")
+            done <<< "$JOB_FLAGS"
+          fi
+
+          gcloud "${deploy_args[@]}"
+
+      - name: Execute Cloud Run job
+        id: execute
+        shell: bash
+        env:
+          PROJECT_ID: ${{ steps.configuration.outputs.project_id }}
+          REGION: ${{ steps.configuration.outputs.region }}
+          JOB: ${{ inputs.job }}
+        run: |
+          set -euo pipefail
+
+          execution="$(gcloud run jobs execute "$JOB" \
+            --project="$PROJECT_ID" \
+            --region="$REGION" \
+            --wait \
+            --format='value(metadata.name)')"
+
+          if [[ -z "${execution//[[:space:]]/}" ]]; then
+            echo "::error title=Missing execution identity::gcloud returned no execution name for job $JOB."
+            exit 1
+          fi
+
+          printf 'execution_name=%s\n' "$execution" >> "$GITHUB_OUTPUT"
+          printf 'Migration execution: %s\n' "$execution"
+
+      - name: Assert execution result
+        shell: bash
+        env:
+          PROJECT_ID: ${{ steps.configuration.outputs.project_id }}
+          REGION: ${{ steps.configuration.outputs.region }}
+          JOB: ${{ inputs.job }}
+          EXECUTION: ${{ steps.execute.outputs.execution_name }}
+        run: |
+          set -euo pipefail
+
+          describe_args=(
+            run jobs executions describe "$EXECUTION"
+            --project="$PROJECT_ID"
+            --region="$REGION"
+          )
+
+          condition="$(gcloud "${describe_args[@]}" \
+            --format='value(status.conditions[0].type,status.conditions[0].state,status.conditions[0].message)')"
+          printf 'Execution condition: %s\n' "$condition"
+
+          counts="$(gcloud "${describe_args[@]}" --format='value(status.succeededCount,status.failedCount)')"
+          succeeded="$(printf '%s' "$counts" | awk '{print $1}')"
+          failed="$(printf '%s' "$counts" | awk '{print $2}')"
+
+          if [[ "${failed:-0}" != "0" || "${succeeded:-0}" == "0" ]]; then
+            echo "::error title=Migration execution failed::Job $JOB execution $EXECUTION reported succeeded=$succeeded failed=$failed."
+            exit 1
+          fi
+
+          echo "Job $JOB execution $EXECUTION completed: succeeded=$succeeded failed=$failed"
+
+      - name: Surface execution logs
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PROJECT_ID: ${{ steps.configuration.outputs.project_id }}
+          REGION: ${{ steps.configuration.outputs.region }}
+          JOB: ${{ inputs.job }}
+          EXECUTION: ${{ steps.execute.outputs.execution_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${EXECUTION//[[:space:]]/}" ]]; then
+            echo "No execution identity was produced, so no logs can be located."
+            exit 0
+          fi
+
+          filter="resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"${JOB}\" AND labels.\"run.googleapis.com/execution_name\"=\"${EXECUTION}\""
+
+          set +e
+          gcloud logging read "$filter" \
+            --project="$PROJECT_ID" \
+            --limit=300 \
+            --format='value(timestamp,textPayload)' \
+            --freshness=1h
+          status=$?
+          set -e
+
+          if [[ "$status" -ne 0 ]]; then
+            echo "::warning title=Log retrieval unavailable::Cloud Logging did not return entries for execution $EXECUTION. Inspect the execution in the Google Cloud console."
+          fi
+
+      - name: Write migration summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          DEPLOYMENT_ENVIRONMENT: ${{ inputs.environment }}
+          PROJECT_ID: ${{ steps.configuration.outputs.project_id }}
+          REGION: ${{ steps.configuration.outputs.region }}
+          JOB: ${{ inputs.job }}
+          IMAGE: ${{ steps.configuration.outputs.image }}
+          EXECUTION: ${{ steps.execute.outputs.execution_name }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Cloud Run Job Execution"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Environment | \`$DEPLOYMENT_ENVIRONMENT\` |"
+            echo "| GCP project | \`$PROJECT_ID\` |"
+            echo "| Region | \`$REGION\` |"
+            echo "| Cloud Run job | \`$JOB\` |"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| Git SHA | \`$GIT_SHA\` |"
+            echo "| Execution | \`${EXECUTION:-not created}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

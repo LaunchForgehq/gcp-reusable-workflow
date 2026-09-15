@@ -61,6 +61,16 @@ on:
         required: false
         default: ""
         type: string
+    secrets:
+      NPMRC:
+        description: >-
+          Optional user-level .npmrc content for private package registries.
+          When supplied it is written to a temporary file and mounted into the
+          image build as a BuildKit secret (id: npmrc), so repositories that
+          resolve private packages can install during `docker build` without
+          baking a credential into an image layer. The Dockerfile must consume
+          it with `RUN --mount=type=secret,id=npmrc,dst=/root/.npmrc ...`.
+        required: false
     outputs:
       service_url:
         description: URL of the deployed Cloud Run service.
@@ -250,12 +260,31 @@ jobs:
           REGISTRY_HOST: ${{ steps.configuration.outputs.region }}-docker.pkg.dev
         run: gcloud auth configure-docker "$REGISTRY_HOST" --quiet
 
+      - name: Prepare private registry configuration
+        shell: bash
+        env:
+          APP_NPMRC: ${{ secrets.NPMRC }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${APP_NPMRC//[[:space:]]/}" ]]; then
+            echo "No private package registry configuration supplied."
+            exit 0
+          fi
+
+          umask 077
+          printf '%s\n' "$APP_NPMRC" > "$RUNNER_TEMP/npmrc"
+          printf 'DOCKER_BUILD_SECRET_FLAG=--secret=id=npmrc,src=%s\n' "$RUNNER_TEMP/npmrc" >> "$GITHUB_ENV"
+          echo "::add-mask::$APP_NPMRC"
+
       - name: Build immutable container image
         shell: bash
         env:
+          DOCKER_BUILDKIT: '1'
+          BUILD_SECRET_FLAG: ${{ env.DOCKER_BUILD_SECRET_FLAG }}
           BUILD_CONTEXT: ${{ inputs.docker_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
-        run: docker build --file "$DOCKERFILE" --tag "$IMAGE" "$BUILD_CONTEXT"
+        run: docker build --file "$DOCKERFILE" --tag "$IMAGE" $BUILD_SECRET_FLAG "$BUILD_CONTEXT"
 
       - name: Push immutable container image
         shell: bash
