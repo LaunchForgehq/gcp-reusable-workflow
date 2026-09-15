@@ -39,6 +39,17 @@ on:
         required: false
         default: ./Dockerfile
         type: string
+      build_args:
+        description: >-
+          Optional Docker build arguments as newline-separated NAME=VALUE
+          entries, passed to `docker build --build-arg`. Intended for
+          non-secret values that must exist at BUILD time because a framework
+          inlines them into the bundle (for example Next.js NEXT_PUBLIC_*
+          variables). Never use this for credentials: build arguments are
+          visible in image metadata.
+        required: false
+        default: ""
+        type: string
       runtime_service_account_variable:
         description: Name of the GitHub Environment variable containing the runtime service account.
         required: false
@@ -326,7 +337,31 @@ jobs:
           BUILD_SECRET_FLAG: ${{ env.DOCKER_BUILD_SECRET_FLAG }}
           BUILD_CONTEXT: ${{ inputs.docker_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
-        run: docker build --file "$DOCKERFILE" --tag "$IMAGE" $BUILD_SECRET_FLAG "$BUILD_CONTEXT"
+          BUILD_ARGS: ${{ inputs.build_args }}
+        run: |
+          set -euo pipefail
+
+          build_arg_flags=()
+
+          if [[ -n "${BUILD_ARGS//[[:space:]]/}" ]]; then
+            while IFS= read -r entry; do
+              [[ -z "${entry//[[:space:]]/}" ]] && continue
+
+              if [[ ! "$entry" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+                echo "::error title=Invalid build argument::build_args entries must be NAME=VALUE. Got: $entry"
+                exit 1
+              fi
+
+              build_arg_flags+=(--build-arg "$entry")
+            done <<< "$BUILD_ARGS"
+          fi
+
+          docker build \
+            --file "$DOCKERFILE" \
+            --tag "$IMAGE" \
+            ${build_arg_flags[@]+"${build_arg_flags[@]}"} \
+            $BUILD_SECRET_FLAG \
+            "$BUILD_CONTEXT"
 
       - name: Push immutable container image
         if: ${{ steps.configuration.outputs.build_required == 'true' }}

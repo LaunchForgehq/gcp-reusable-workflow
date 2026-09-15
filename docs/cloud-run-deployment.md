@@ -27,6 +27,7 @@ name out of application repositories.
 | `image` | No | empty | Full image reference to deploy. When set, the image is neither built nor pushed, so one built release can be deployed to several services. The reference must already exist in Artifact Registry |
 | `docker_context` | No | `.` | Docker build context |
 | `dockerfile` | No | `./Dockerfile` | Dockerfile path |
+| `build_args` | No | empty | Newline-separated `NAME=VALUE` entries passed to `docker build --build-arg`. Use only for non-secret values that must exist at build time because the framework inlines them into the bundle (for example Next.js `NEXT_PUBLIC_*` variables) |
 | `runtime_service_account_variable` | No | empty | Name of the GitHub Environment variable holding the runtime service account |
 | `env_vars` | No | empty | Newline-separated non-sensitive `KEY=VALUE` settings |
 | `secret_refs` | No | empty | Newline-separated Secret Manager `KEY=SECRET:VERSION` references. `KEY` may be an absolute mount path |
@@ -55,6 +56,27 @@ They are non-sensitive deployment metadata, not application credentials.
 | Secret | Required | Purpose |
 | --- | --- | --- |
 | `NPMRC` | No | `.npmrc` content for private package registries. It is written to a temporary file and mounted into the image build as BuildKit secret `id: npmrc`; the Dockerfile must consume it with `RUN --mount=type=secret,id=npmrc,dst=/root/.npmrc ...`. Without it, an image whose install step resolves private packages cannot be built |
+
+### Build-time values
+
+Most application configuration belongs at container start: `env_vars` and
+`secret_refs` are applied to the Cloud Run revision and can change between
+revisions without rebuilding. A smaller class of values must be present while
+the image is built, because a framework resolves and inlines them into the
+produced bundle. Two inputs cover that class, and they carry different
+security properties.
+
+`build_args` is the correct input for **non-secret** build-time values. Build
+arguments are recorded in image metadata, so a value passed here is visible to
+anyone who can inspect the image. `NAME` must be a valid environment-variable
+name; entries that do not match `NAME=VALUE` fail the build before Docker runs.
+
+Values that must stay out of image metadata need a BuildKit secret instead, and
+the Dockerfile must declare the corresponding `RUN --mount=type=secret,...`.
+The existing `NPMRC` secret covers registry authentication. Any other
+build-time secret must be added to this workflow deliberately, as a named
+secret with a fixed mount id, so that the set of values reaching an image build
+stays reviewable rather than being driven by an open-ended caller input.
 
 The workflow exposes `service_url`. A caller can read it as `needs.deploy.outputs.service_url` when a downstream job declares `needs: deploy`.
 
