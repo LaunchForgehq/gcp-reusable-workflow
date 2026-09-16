@@ -395,6 +395,14 @@ jobs:
           region: ${{ steps.configuration.outputs.region }}
           service: ${{ inputs.service }}
           image: ${{ steps.configuration.outputs.image }}
+          # A deploy owns the revision and nothing else. By default this action
+          # adds `managed-by: github-actions` and `commit-sha: <sha>` as labels,
+          # which are envelope values Terraform declares - so a release wrote
+          # configuration it is supposed to obey, and the next `terraform plan`
+          # reported the deploy's own labels as drift to be reverted. The image
+          # digest and the revision name already carry the release identity, so
+          # the labels added a second authority and nothing else.
+          skip_default_labels: true
           env_vars: ${{ inputs.env_vars }}
           env_vars_update_strategy: merge
           secrets: ${{ inputs.secret_refs }}
