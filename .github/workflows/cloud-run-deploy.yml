@@ -108,6 +108,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  packages: read
 
 jobs:
   deploy:
@@ -316,18 +317,36 @@ jobs:
         shell: bash
         env:
           APP_NPMRC: ${{ secrets.NPMRC }}
+          PACKAGE_TOKEN: ${{ github.token }}
+          BUILD_CONTEXT: ${{ inputs.docker_context }}
         run: |
           set -euo pipefail
 
-          if [[ -z "${APP_NPMRC//[[:space:]]/}" ]]; then
+          npmrc="$RUNNER_TEMP/npmrc"
+
+          if [[ -n "${APP_NPMRC//[[:space:]]/}" ]]; then
+            umask 077
+            printf '%s\n' "$APP_NPMRC" > "$npmrc"
+            echo "::add-mask::$APP_NPMRC"
+          elif [[ -f "$BUILD_CONTEXT/.npmrc" ]]; then
+            # No explicit registry credential was supplied, so the build
+            # authenticates with the repository-scoped GITHUB_TOKEN instead of
+            # a long-lived package token. The registry and scope mapping come
+            # from the repository's own .npmrc; only the token is added, and
+            # only to the BuildKit secret, so no credential reaches an image
+            # layer, the build log, or the pushed artifact.
+            umask 077
+            {
+              printf '//npm.pkg.github.com/:_authToken=%s\n' "$PACKAGE_TOKEN"
+              cat "$BUILD_CONTEXT/.npmrc"
+            } > "$npmrc"
+            echo "::add-mask::$PACKAGE_TOKEN"
+          else
             echo "No private package registry configuration supplied."
             exit 0
           fi
 
-          umask 077
-          printf '%s\n' "$APP_NPMRC" > "$RUNNER_TEMP/npmrc"
-          printf 'DOCKER_BUILD_SECRET_FLAG=--secret=id=npmrc,src=%s\n' "$RUNNER_TEMP/npmrc" >> "$GITHUB_ENV"
-          echo "::add-mask::$APP_NPMRC"
+          printf 'DOCKER_BUILD_SECRET_FLAG=--secret=id=npmrc,src=%s\n' "$npmrc" >> "$GITHUB_ENV"
 
       - name: Build immutable container image
         if: ${{ steps.configuration.outputs.build_required == 'true' }}
